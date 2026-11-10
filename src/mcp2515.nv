@@ -1,0 +1,1148 @@
+// mcp2515 — Microchip's MCP2515, a stand-alone CAN 2.0B controller with an
+// SPI interface, as embedded-hal-nv's `CanBus` over an SPI bus and an
+// optional interrupt pin.
+//
+// The facts below are from Microchip's data sheet "MCP2515: Stand-Alone CAN
+// Controller with SPI Interface", DS20001801J, 2019.  A section, register
+// or table is named where a fact is used.
+//
+// The SPI instruction set (§ 12, Table 12-1), each started by dropping CS
+// and ended by raising it:
+//
+//   0xC0       RESET            registers to power-up values, Configuration mode
+//   0x03 a     READ             from address a, the address advancing
+//   0x90|n<<2|m<<1  READ RX BUFFER  from RXBn SIDH (m 0) or D0 (m 1); the
+//                               RXnIF flag clears when CS is raised
+//   0x02 a     WRITE            from address a, the address advancing
+//   0x40|abc   LOAD TX BUFFER   from TXBn SIDH (c 0) or D0 (c 1), a b selecting n
+//   0x80|nnn   RTS              sets TXREQ of the buffers named by the bits
+//   0xA0       READ STATUS      one byte: RX0IF, RX1IF, and TXREQ and TXnIF per buffer
+//   0xB0       RX STATUS        one byte: buffers holding a message, frame type, filter hit
+//   0x05 a m d BIT MODIFY       the bits of mask m in register a take the bits of d
+//
+// The registers, as this driver uses them (§ 11, Table 11-2):
+//
+//   0x00 to 0x1B  RXF0 to RXF5, six acceptance filters of four bytes
+//                 (SIDH, SIDL, EID8, EID0) at 0x00, 0x04, 0x08, 0x10, 0x14, 0x18
+//   0x0C BFPCTRL  0x0D TXRTSCTRL    the RXnBF and TXnRTS pins (not used here)
+//   0x0E CANSTAT  OPMOD (7:5), ICOD (3:1); also at every 0xXE
+//   0x0F CANCTRL  REQOP (7:5), ABAT (4), OSM (3), CLKEN (2), CLKPRE (1:0)
+//   0x1C TEC      0x1D REC      the error counters
+//   0x20, 0x24    RXM0, RXM1    the two acceptance masks of four bytes
+//   0x28 CNF3  0x29 CNF2  0x2A CNF1   the bit timing
+//   0x2B CANINTE  0x2C CANINTF  the interrupt enables and flags
+//   0x2D EFLG     error flags
+//   0x30, 0x40, 0x50  TXB0CTRL to TXB2CTRL   TXREQ (3), TXP (1:0)
+//   0x31 to 0x3D  the transmit buffer: SIDH, SIDL, EID8, EID0, DLC, D0 to D7
+//   0x60, 0x70    RXB0CTRL, RXB1CTRL         RXM (6:5), BUKT (2, RXB0 only)
+//   0x61 to 0x6D  the receive buffer, as above
+//
+// The rules of the part that shape this driver:
+//
+//  - CNF1 to CNF3, the masks and the filters are writable in Configuration
+//    mode only, and the masks and filters read as zero in every other mode
+//    (§ 4.5.5).  A write outside Configuration mode is ignored without an
+//    error, so every function that writes them checks the mode first.
+//  - BIT MODIFY works on the registers marked in Table 11-1 only; on any
+//    other register it forces the mask to 0xFF and writes the whole byte.
+//    The driver uses it for CANCTRL, CANINTE, CANINTF, EFLG, TXBnCTRL and
+//    RXBnCTRL.
+//  - A mode change takes effect only after the pending transmissions end
+//    and, to join a bus in Normal mode, after 11 recessive bits.  The
+//    requested mode is verified in CANSTAT (§ 10).
+//  - No SPI instruction may follow a RESET before the oscillator start-up
+//    timer has run its 128 OSC1 cycles (§ 8.1).
+//  - Two transmit buffers of equal priority send the one with the higher
+//    number first (§ 3.2).
+//  - The filter of a standard frame also compares the first two data bytes
+//    against the EID15 to EID0 bits of the filter and the mask (§ 4.5.1), so
+//    a mask for standard frames has those bits zero.  With RXM 00, whether a
+//    filter applies to standard or to extended frames is its EXIDE bit.
+//
+// Drivers read for their fixes, nothing ported: Zephyr's
+// `drivers/can/can_mcp2515.c`, the `mcp2515` crate 0.3.0 and the Arduino
+// libraries `autowp/arduino-mcp2515` and `coryjfowler/MCP_CAN_lib`.  Each
+// fix kept is named at its site.
+//
+// The driver keeps no state: the mode, the priorities and the timing are
+// read from the part when they are needed.  The SPI bus, the chip-select
+// and interrupt pins and the timer enter through `MccLink`, which
+// `Mcp2515Link` implements over a board's handles and a test implements over
+// a double of the part.
+
+use embedded_hal.{ BoardSpi, BoardGpio, BoardTimer, SpiBus, GpioOut, Timer, CanBus, CanBusFrame, CanBusErrors }
+use dev_bus.{ DeviceWiring, DevBytes }
+
+// The instructions.
+let CMD_RESET     = 0xC0
+let CMD_READ      = 0x03
+let CMD_WRITE     = 0x02
+let CMD_LOAD_TX   = 0x40
+let CMD_RTS       = 0x80
+let CMD_STATUS    = 0xA0
+let CMD_RX_STATUS = 0xB0
+let CMD_RX_BUFFER = 0x90
+let CMD_MODIFY    = 0x05
+
+// The registers.
+let REG_CANSTAT = 0x0E
+let REG_CANCTRL = 0x0F
+let REG_TEC     = 0x1C
+let REG_CNF3    = 0x28
+let REG_CANINTE = 0x2B
+let REG_CANINTF = 0x2C
+let REG_EFLG    = 0x2D
+let REG_TXB0    = 0x30
+let REG_RXB0    = 0x60
+let REG_RXM0    = 0x20
+
+// CANCTRL.
+let CTRL_REQOP_MASK = 0xE0
+let CTRL_ABAT       = 0x10
+let CTRL_OSM        = 0x08
+let CTRL_CLKEN      = 0x04
+let CTRL_MASK_OPTS  = 0x0F
+
+// RXBnCTRL.
+let RXM_ANY  = 0x60
+let RXB_BUKT = 0x04
+
+// TXBnCTRL.
+let TXREQ = 0x08
+let TXP_MASK = 0x03
+
+// READ STATUS, the TXREQ bit of each buffer.
+let ST_TXREQ0 = 0x04
+let ST_TXREQ1 = 0x10
+let ST_TXREQ2 = 0x40
+
+// EFLG.
+let EFLG_TXBO  = 0x20
+let EFLG_TXEP  = 0x10
+let EFLG_RXEP  = 0x08
+let EFLG_OVR   = 0xC0
+
+// The SPI clock and mode `link_setup` asks for: 4 MHz, mode 0, which the
+// part supports to 10 MHz (§ 12.1).
+let SPI_HZ   = 4000000
+let SPI_MODE = 0
+
+// After RESET the oscillator start-up timer holds the part for 128 OSC1
+// cycles (§ 8.1), at most 128 us at the 1 MHz the oscillator can be.  The
+// driver waits 1 ms and confirms the Configuration mode, and repeats the
+// RESET up to ten times for a crystal that is slow to start after power-up.
+let RESET_WAIT_US = 1000
+let RESET_TRIES   = 10
+
+// A mode change waits for the bus to be idle, 11 recessive bits, which is
+// 1.1 ms at 10 kbit/s.  The driver polls CANSTAT every 100 us for 50 ms.
+let MODE_STEP_US = 100
+let MODE_TRIES   = 500
+
+// The abort of all transmissions is polled the same way.
+let ABORT_TRIES = 100
+
+// ── The operating modes ──────────────────────────────────────────────
+
+// The modes of CANSTAT.OPMOD and CANCTRL.REQOP (§ 10).
+pub const MCP_MODE_NORMAL   = 0
+pub const MCP_MODE_SLEEP    = 1
+pub const MCP_MODE_LOOPBACK = 2
+pub const MCP_MODE_LISTEN   = 3
+pub const MCP_MODE_CONFIG   = 4
+
+// The interrupt flags of CANINTF and the enables of CANINTE (Table 11-2).
+pub const MCP_INT_RX0   = 0x01
+pub const MCP_INT_RX1   = 0x02
+pub const MCP_INT_TX0   = 0x04
+pub const MCP_INT_TX1   = 0x08
+pub const MCP_INT_TX2   = 0x10
+pub const MCP_INT_ERROR = 0x20
+pub const MCP_INT_WAKE  = 0x40
+pub const MCP_INT_MERR  = 0x80
+
+// The values of EFLG (Table 11-2).
+pub const MCP_EFLG_EWARN = 0x01
+pub const MCP_EFLG_RXWAR = 0x02
+pub const MCP_EFLG_TXWAR = 0x04
+pub const MCP_EFLG_RXEP  = 0x08
+pub const MCP_EFLG_TXEP  = 0x10
+pub const MCP_EFLG_TXBO  = 0x20
+pub const MCP_EFLG_RX0OVR = 0x40
+pub const MCP_EFLG_RX1OVR = 0x80
+
+// ── What the part is told at open ────────────────────────────────────
+
+// The settings `open_code` writes.  `mode` is one of the `MCP_MODE_*`
+// values the part runs in afterwards.  `one_shot` makes a frame attempt
+// transmission once (§ 3.4).  `rollover` lets a frame for a full RXB0
+// move to RXB1 (§ 4.2.1).  `accept_all` turns the masks and filters off
+// (RXM 11), which receives every frame, standard and extended; with it
+// false the masks and filters decide, and the caller sets them (see
+// `filter_set`).  `irq_mask` is written to CANINTE, the sources that drive
+// the INT pin, and 0 leaves the pin quiet and the flags to be polled.
+// `clkout` is the CLKOUT pin: 0 disables it, 1, 2, 4 or 8 enable it at that
+// divider of the oscillator.  `timing` is a packed CNF1, CNF2 and CNF3
+// (`bit_timing_pack`) to use in place of the one `bit_timing` finds, or -1.
+pub @value
+struct Mcp2515Config
+    mode: Int
+    one_shot: Bool
+    rollover: Bool
+    accept_all: Bool
+    irq_mask: Int
+    clkout: Int
+    timing: Int
+
+// The settings `open_code` uses when the program names none: Normal mode,
+// repeated transmission, rollover on, every frame received, no interrupt
+// source, the CLKOUT pin off and the bit timing found from the bit rate.
+//
+// Fix kept: the CLKOUT pin is off.  The part powers up with CLKOUT running
+// at a divider of 8 (§ 8.2), a clock on a pin that most boards leave
+// unconnected; the Arduino libraries leave it on.
+//
+// ```novo
+// use mcp2515
+//
+// fn main() [io]
+//     let c = mcp2515.config_default()
+//     println("${c.mode} ${c.accept_all} ${c.timing}")   // 0 true -1
+// ```
+pub fn config_default() -> Mcp2515Config
+    Mcp2515Config { mode: MCP_MODE_NORMAL, one_shot: false, rollover: true, accept_all: true,
+                    irq_mask: 0, clkout: 0, timing: -1 }
+
+// ── The link ─────────────────────────────────────────────────────────
+
+// What the driver needs from the board.  `link_xfer` runs one SPI
+// transaction: CS low, the bytes of `tx`, `n` bytes read into `dst`, CS
+// high; it answers `false` for a wiring with no chip select.  `link_wait`
+// waits `us` microseconds.  `link_irq` is the level of the INT pin, 0 or 1,
+// and -1 for a wiring with no interrupt pin.  `link_setup` makes the bus
+// and the pins ready and answers whether the wiring has a chip select.
+pub trait MccLink
+    fn link_xfer(self, tx: DevBytes, n: Int, var dst: DevBytes) -> Bool [hw]
+    fn link_wait(self, us: Int) [hw]
+    fn link_irq(self) -> Int [hw]
+    fn link_setup(self) -> Bool [hw]
+
+// ── Bit timing ───────────────────────────────────────────────────────
+//
+// The bit time is SyncSeg (1 TQ), PropSeg (1 to 8), PS1 (1 to 8) and PS2
+// (2 to 8), so 5 to 25 TQ; a TQ is `2 x (BRP + 1) / osc` (Register 5-1), so
+// the bit rate is `osc / (2 x BRP' x N)` for BRP' = BRP + 1 and N TQ per
+// bit.  The sample point is at the end of PS1.  CNF1 holds SJW and BRP,
+// CNF2 BTLMODE, SAM, PS1 and PropSeg, and CNF3 PS2 (Registers 5-1 to 5-3).
+
+// Packs the three registers into one value, CNF1 in bits 16 to 23, CNF2 in
+// 8 to 15 and CNF3 in 0 to 7.
+//
+// ```novo
+// use mcp2515
+//
+// fn main() [io]
+//     println("${mcp2515.bit_timing_pack(0x40, 0xE5, 0x03)}")   // 4252931
+// ```
+pub fn bit_timing_pack(cnf1: Int, cnf2: Int, cnf3: Int) -> Int
+    ((cnf1 & 0xFF) << 16) | ((cnf2 & 0xFF) << 8) | (cnf3 & 0xFF)
+
+// CNF1, CNF2 and CNF3 of a packed timing.
+pub fn timing_cnf1(t: Int) -> Int
+    (t >> 16) & 0xFF
+
+pub fn timing_cnf2(t: Int) -> Int
+    (t >> 8) & 0xFF
+
+pub fn timing_cnf3(t: Int) -> Int
+    t & 0xFF
+
+// The time quanta in one bit of a packed timing, 1 + PropSeg + PS1 + PS2.
+// With BTLMODE clear, PS2 is the greater of PS1 and 2 TQ (Register 5-2).
+pub fn timing_tq(t: Int) -> Int
+    let c2 = timing_cnf2(t)
+    let ps1 = ((c2 >> 3) & 7) + 1
+    let prop = (c2 & 7) + 1
+    var ps2 = ps1
+    if ps2 < 2
+        ps2 = 2
+    if (c2 & 0x80) != 0
+        ps2 = (timing_cnf3(t) & 7) + 1
+    1 + prop + ps1 + ps2
+
+// The sample point of a packed timing in parts per thousand of the bit:
+// the end of PS1 over the bit.
+pub fn timing_sample_permille(t: Int) -> Int
+    let c2 = timing_cnf2(t)
+    let before = 1 + (c2 & 7) + 1 + ((c2 >> 3) & 7) + 1
+    before * 1000 / timing_tq(t)
+
+// The bit rate of a packed timing for an oscillator of `osc_hz`, in bits
+// per second, rounded to the nearest: `osc / (2 x BRP' x N)`.
+//
+// ```novo
+// use mcp2515
+//
+// fn main() [io]
+//     // 16 MHz crystal, CNF1 0x40, CNF2 0xE5, CNF3 0x03: 500 kbit/s.
+//     println("${mcp2515.timing_rate(16000000, mcp2515.bit_timing_pack(0x40, 0xE5, 0x03))}")   // 500000
+// ```
+pub fn timing_rate(osc_hz: Int, t: Int) -> Int
+    let brp = (timing_cnf1(t) & 0x3F) + 1
+    let d = 2 * brp * timing_tq(t)
+    (osc_hz + d / 2) / d
+
+// The packed timing for a bit rate at an oscillator of `osc_hz`, solved:
+// the smallest BRP' whose N is a whole number from 5 to 25, which gives the
+// most TQ and so the finest sample point; the sample point `sample_permille`
+// of the bit, held to what PS2 of 2 to 8 and PropSeg and PS1 of 16 TQ in
+// all allow; PropSeg the upper half of the segment before the sample point
+// and PS1 the rest; BTLMODE set; SAM as asked; and SJW of `sjw`, 1 to 4,
+// held below PS2.  Answers -1 when no BRP' makes the rate exactly.
+//
+// Fix kept: a rate that needs fewer than 5 TQ is refused.  Both reference
+// tables for an 8 MHz crystal at 1 Mbit/s give 4 TQ and a PS2 of 1 TQ,
+// below the 2 TQ the data sheet gives as the minimum (Register 5-3).
+//
+// ```novo
+// use mcp2515
+//
+// fn main() [io]
+//     // 16 MHz crystal, 500 kbit/s, 75 %: CNF1 0x00, CNF2 0xE5, CNF3 0x03.
+//     let t = mcp2515.bit_timing_solve(16000000, 500000, 750, 1, true)
+//     println("${mcp2515.timing_cnf2(t)} ${mcp2515.timing_cnf3(t)}")   // 229 3
+// ```
+pub fn bit_timing_solve(osc_hz: Int, rate: Int, sample_permille: Int, sjw: Int, sam: Bool) -> Int
+    if osc_hz <= 0 or rate <= 0
+        return -1
+    for brp in 1..65
+        let d = 2 * brp * rate
+        if osc_hz % d == 0
+            let n = osc_hz / d
+            if n >= 5 and n <= 25
+                return timing_of(brp, n, sample_permille, sjw, sam)
+    -1
+
+// The registers for BRP' `brp`, `n` TQ per bit, a sample point and an SJW.
+fn timing_of(brp: Int, n: Int, sample_permille: Int, sjw: Int, sam: Bool) -> Int
+    // The TQ up to and including the sample point: SyncSeg, PropSeg, PS1.
+    var before = (n * sample_permille + 500) / 1000
+    var ps2 = n - before
+    if ps2 < 2
+        ps2 = 2
+    if ps2 > 8
+        ps2 = 8
+    before = n - ps2
+    // PropSeg and PS1 hold 16 TQ at most between them.
+    if before > 17
+        before = 17
+        ps2 = n - 17
+    let seg = before - 1
+    let prop = (seg + 1) / 2
+    let ps1 = seg - prop
+    var s = sjw
+    if s < 1
+        s = 1
+    if s > 4
+        s = 4
+    if s > ps2 - 1
+        s = ps2 - 1
+    var cnf2 = 0x80 | ((ps1 - 1) << 3) | (prop - 1)
+    if sam
+        cnf2 = cnf2 | 0x40
+    bit_timing_pack(((s - 1) << 6) | (brp - 1), cnf2, ps2 - 1)
+
+// The registers of the reference libraries for an 8 MHz crystal at a bit
+// rate, or -1.  These are the values of `coryjfowler/MCP_CAN_lib`, which the
+// `mcp2515` crate copies, with CNF3's SOF bit clear.  All of them make the
+// rate exactly or, for 33.3 kbit/s, to 33333.3, with three samples a bit and
+// a sample point of 75 %, 80 % at 80 kbit/s.  The 1 Mbit/s row of the
+// libraries is left out (see `bit_timing_solve`).
+fn known_8mhz(rate: Int) -> Int
+    match rate
+        5000    => bit_timing_pack(0xA7, 0xF6, 0x04)
+        10000   => bit_timing_pack(0x93, 0xF6, 0x04)
+        20000   => bit_timing_pack(0x89, 0xF6, 0x04)
+        31250   => bit_timing_pack(0x87, 0xE5, 0x03)
+        33333   => bit_timing_pack(0x85, 0xF6, 0x04)
+        40000   => bit_timing_pack(0x84, 0xF6, 0x04)
+        50000   => bit_timing_pack(0x84, 0xE5, 0x03)
+        80000   => bit_timing_pack(0x84, 0xD3, 0x01)
+        100000  => bit_timing_pack(0x81, 0xF6, 0x04)
+        125000  => bit_timing_pack(0x81, 0xE5, 0x03)
+        200000  => bit_timing_pack(0x80, 0xF6, 0x04)
+        250000  => bit_timing_pack(0x80, 0xE5, 0x03)
+        500000  => bit_timing_pack(0x00, 0xD1, 0x01)
+        _       => -1
+
+// The same for a 16 MHz crystal.
+fn known_16mhz(rate: Int) -> Int
+    match rate
+        5000    => bit_timing_pack(0x3F, 0xFF, 0x07)
+        10000   => bit_timing_pack(0x67, 0xF6, 0x04)
+        20000   => bit_timing_pack(0x53, 0xF6, 0x04)
+        33333   => bit_timing_pack(0x4E, 0xE5, 0x03)
+        40000   => bit_timing_pack(0x49, 0xF6, 0x04)
+        50000   => bit_timing_pack(0x47, 0xF6, 0x04)
+        80000   => bit_timing_pack(0x44, 0xF6, 0x04)
+        100000  => bit_timing_pack(0x44, 0xE5, 0x03)
+        125000  => bit_timing_pack(0x43, 0xE5, 0x03)
+        200000  => bit_timing_pack(0x41, 0xF6, 0x04)
+        250000  => bit_timing_pack(0x41, 0xE5, 0x03)
+        500000  => bit_timing_pack(0x40, 0xE5, 0x03)
+        1000000 => bit_timing_pack(0x00, 0xCA, 0x01)
+        _       => -1
+
+// The registers of the reference libraries for a crystal and a bit rate,
+// or -1 when the pair is not in the table: 8 MHz and 16 MHz at the usual
+// rates from 5 to 1000 kbit/s.
+//
+// ```novo
+// use mcp2515
+//
+// fn main() [io]
+//     println("${mcp2515.timing_cnf1(mcp2515.bit_timing_known(16000000, 500000))}")   // 64
+// ```
+pub fn bit_timing_known(osc_hz: Int, rate: Int) -> Int
+    if osc_hz == 8000000
+        return known_8mhz(rate)
+    if osc_hz == 16000000
+        return known_16mhz(rate)
+    -1
+
+// The packed timing `open_code` writes for a bit rate: the table when it
+// has the pair, else the solver at a sample point of 75 %, SJW of 1 TQ and
+// three samples a bit.  -1 when the part cannot make the rate.
+pub fn bit_timing(osc_hz: Int, rate: Int) -> Int
+    let k = bit_timing_known(osc_hz, rate)
+    if k >= 0
+        return k
+    bit_timing_solve(osc_hz, rate, 750, 1, true)
+
+// ── Frame encoding ───────────────────────────────────────────────────
+
+// SIDH, SIDL, EID8 and EID0 of an identifier, packed from SIDH in bits 24
+// to 31 down to EID0 in 0 to 7.  A standard identifier is SID10 to SID0 in
+// SIDH and the top three bits of SIDL; an extended one adds EID17 and
+// EID16 in the low two bits of SIDL, EID15 to EID8 and EID7 to EID0, and
+// sets EXIDE (SIDL bit 3) (Registers 3-3 to 3-6).
+//
+// ```novo
+// use mcp2515
+//
+// fn main() [io]
+//     println("${mcp2515.id_regs(0x123, false)}")   // 610402304
+// ```
+pub fn id_regs(id: Int, extended: Bool) -> Int
+    if not extended
+        let sidh = (id >> 3) & 0xFF
+        let sidl = (id & 7) << 5
+        return (sidh << 24) | (sidl << 16)
+    let sidh = (id >> 21) & 0xFF
+    let sidl = (((id >> 18) & 7) << 5) | 0x08 | ((id >> 16) & 3)
+    (sidh << 24) | (sidl << 16) | (((id >> 8) & 0xFF) << 8) | (id & 0xFF)
+
+// The identifier a receive buffer holds in SIDH, SIDL, EID8 and EID0, and
+// whether it is extended (SIDL bit 3, IDE).
+pub fn regs_id(sidh: Int, sidl: Int, eid8: Int, eid0: Int) -> Int
+    let std = (sidh << 3) | (sidl >> 5)
+    if (sidl & 0x08) == 0
+        return std
+    (sidh << 21) | (((sidl >> 5) & 7) << 18) | ((sidl & 3) << 16) | (eid8 << 8) | eid0
+
+// The frame a receive buffer's 13 bytes hold: SIDH, SIDL, EID8, EID0, DLC
+// and eight data bytes.  A standard remote frame is flagged by SRR (SIDL
+// bit 4), an extended one by RTR (DLC bit 6) (Registers 4-5 and 4-8).  A
+// DLC above 8 is 8 bytes, as CAN 2.0B says.
+pub fn frame_of_buffer(b: DevBytes) -> CanBusFrame
+    let sidl = b[1] as Int
+    let ext = (sidl & 0x08) != 0
+    let dlc = (b[4] as Int) & 0x0F
+    var len = dlc
+    if len > 8
+        len = 8
+    var remote = (sidl & 0x10) != 0
+    if ext
+        remote = ((b[4] as Int) & 0x40) != 0
+    var data = 0
+    if not remote
+        for i in 0..len
+            data = data | ((b[5 + i] as Int) << (8 * i))
+    CanBusFrame { id: regs_id(b[0] as Int, sidl, b[2] as Int, b[3] as Int), extended: ext,
+                  remote: remote, len: len, data: data }
+
+// ── SPI instructions, over any link ──────────────────────────────────
+
+// READ: `n` registers from `addr` into `dst`.
+pub fn regs_read<L: MccLink>(l: L, addr: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+    var tx: DevBytes = Vec.new()
+    let _ = tx.push(CMD_READ as u8)
+    let _ = tx.push(addr as u8)
+    l.link_xfer(tx, n, var dst)
+
+// One register, or `None` when the part does not answer.  An SPI bus no
+// part drives reads 0xFF, which callers that must tell the difference check
+// for.
+pub fn reg_read<L: MccLink>(l: L, addr: Int) -> ?Int [hw]
+    var b: DevBytes = Vec.new()
+    if not regs_read(l, addr, 1, var b)
+        return None
+    Some(b[0] as Int)
+
+// WRITE: one register.  Whether the wiring has a chip select; the part
+// acknowledges nothing.
+pub fn reg_write<L: MccLink>(l: L, addr: Int, v: Int) -> Bool [hw]
+    var tx: DevBytes = Vec.new()
+    let _ = tx.push(CMD_WRITE as u8)
+    let _ = tx.push(addr as u8)
+    let _ = tx.push((v & 0xFF) as u8)
+    var none: DevBytes = Vec.new()
+    l.link_xfer(tx, 0, var none)
+
+// BIT MODIFY: the bits of `mask` in `addr` take the bits of `data`.
+// Only the registers of Table 11-1 take it; on the others the part forces
+// the mask to 0xFF.
+pub fn reg_modify<L: MccLink>(l: L, addr: Int, mask: Int, data: Int) -> Bool [hw]
+    var tx: DevBytes = Vec.new()
+    let _ = tx.push(CMD_MODIFY as u8)
+    let _ = tx.push(addr as u8)
+    let _ = tx.push((mask & 0xFF) as u8)
+    let _ = tx.push((data & 0xFF) as u8)
+    var none: DevBytes = Vec.new()
+    l.link_xfer(tx, 0, var none)
+
+// A one-byte instruction that answers one byte: READ STATUS or RX STATUS.
+fn status_of<L: MccLink>(l: L, cmd: Int) -> Int [hw]
+    var tx: DevBytes = Vec.new()
+    let _ = tx.push(cmd as u8)
+    var b: DevBytes = Vec.new()
+    if not l.link_xfer(tx, 1, var b)
+        return -1
+    b[0] as Int
+
+// READ STATUS: bit 0 RX0IF, 1 RX1IF, 2 TXREQ of TXB0, 3 TX0IF, 4 TXREQ of
+// TXB1, 5 TX1IF, 6 TXREQ of TXB2, 7 TX2IF (Figure 12-8).  -1 when the
+// wiring has no chip select.
+pub fn status_read<L: MccLink>(l: L) -> Int [hw]
+    status_of(l, CMD_STATUS)
+
+// RX STATUS: bits 7 and 6 say which buffers hold a message (RXB0 is bit
+// 6), bits 4 and 3 the frame type (extended, remote), bits 2 to 0 the
+// filter that matched (Figure 12-9).  -1 when the wiring has no chip
+// select.
+pub fn rx_status_read<L: MccLink>(l: L) -> Int [hw]
+    status_of(l, CMD_RX_STATUS)
+
+// The filter an RX STATUS byte names, 0 to 5; 6 and 7 are RXF0 and RXF1
+// after a rollover into RXB1.
+pub fn rx_status_filter(s: Int) -> Int
+    s & 7
+
+// ── Modes ────────────────────────────────────────────────────────────
+
+// The operating mode in CANSTAT.OPMOD, 0 to 4, or `None`.
+pub fn mode_read<L: MccLink>(l: L) -> ?Int [hw]
+    let Some(v) = reg_read(l, REG_CANSTAT) else return None
+    Some((v & CTRL_REQOP_MASK) >> 5)
+
+// Whether CANSTAT shows the mode `want` within the time a mode change
+// takes (see MODE_TRIES).  The first read is made at once.
+fn mode_wait<L: MccLink>(l: L, want: Int) -> Bool [hw]
+    for _i in 0..MODE_TRIES
+        if mode_read(l) == Some(want)
+            return true
+        l.link_wait(MODE_STEP_US)
+    false
+
+// Requests a mode with BIT MODIFY on CANCTRL and waits until CANSTAT shows
+// it.  The change waits for the pending transmissions and, to join a bus,
+// for 11 recessive bits (§ 10), so it is verified and not assumed.  Whether
+// the part is in the mode.
+pub fn mode_set<L: MccLink>(l: L, mode: Int) -> Bool [hw]
+    if mode < 0 or mode > MCP_MODE_CONFIG
+        return false
+    if not reg_modify(l, REG_CANCTRL, CTRL_REQOP_MASK, mode << 5)
+        return false
+    mode_wait(l, mode)
+
+// Resets the part with the RESET instruction and confirms Configuration
+// mode in CANSTAT, waiting 1 ms each time for the oscillator start-up
+// timer, and repeating up to ten times.  Whether the part answered as a
+// reset part.
+//
+// Fix kept: the instruction is followed by a read that confirms the
+// result.  The Arduino libraries wait 10 ms and trust it, which hides an
+// absent part or a bus mis-wired at the chip select.
+pub fn reset<L: MccLink>(l: L) -> Bool [hw]
+    for _i in 0..RESET_TRIES
+        var tx: DevBytes = Vec.new()
+        let _ = tx.push(CMD_RESET as u8)
+        var none: DevBytes = Vec.new()
+        if l.link_xfer(tx, 0, var none)
+            l.link_wait(RESET_WAIT_US)
+            if mode_read(l) == Some(MCP_MODE_CONFIG)
+                return true
+    false
+
+// Enters Configuration mode, in which the bit timing, the masks and the
+// filters can be written.
+pub fn config_enter<L: MccLink>(l: L) -> Bool [hw]
+    mode_set(l, MCP_MODE_CONFIG)
+
+// Leaves Configuration mode for `mode`.
+pub fn config_leave<L: MccLink>(l: L, mode: Int) -> Bool [hw]
+    mode_set(l, mode)
+
+// ── Open ─────────────────────────────────────────────────────────────
+
+// The CANCTRL bits other than REQOP for the options: one-shot and the
+// CLKOUT pin.
+fn ctrl_opts(c: Mcp2515Config) -> Int
+    var v = 0
+    if c.one_shot
+        v = v | CTRL_OSM
+    if c.clkout > 0
+        v = v | CTRL_CLKEN
+        // CLKPRE 00 divides by 1, 01 by 2, 10 by 4, 11 by 8 (Register 10-1).
+        if c.clkout >= 8
+            v = v | 3
+        elif c.clkout >= 4
+            v = v | 2
+        elif c.clkout >= 2
+            v = v | 1
+    v
+
+// The writes of `open_code` after the reset: the bit timing `t`, written
+// from CNF3 and read back; the interrupt enables; the receive buffer modes;
+// and the options and the mode in one BIT MODIFY of CANCTRL, confirmed in
+// CANSTAT.  The codes are those of `open_code`.
+fn open_regs<L: MccLink>(l: L, t: Int, c: Mcp2515Config) -> Int [hw]
+    // CNF3, CNF2, CNF1 are consecutive from 0x28.
+    var tx: DevBytes = Vec.new()
+    let _ = tx.push(CMD_WRITE as u8)
+    let _ = tx.push(REG_CNF3 as u8)
+    let _ = tx.push(timing_cnf3(t) as u8)
+    let _ = tx.push(timing_cnf2(t) as u8)
+    let _ = tx.push(timing_cnf1(t) as u8)
+    var none: DevBytes = Vec.new()
+    if not l.link_xfer(tx, 0, var none)
+        return -1
+    var back: DevBytes = Vec.new()
+    if not regs_read(l, REG_CNF3, 3, var back)
+        return -1
+    if (back[0] as Int) != timing_cnf3(t) or (back[1] as Int) != timing_cnf2(t) or (back[2] as Int) != timing_cnf1(t)
+        return -4
+    if not reg_write(l, REG_CANINTE, c.irq_mask)
+        return -1
+    var rxb0 = RXM_ANY
+    if not c.accept_all
+        rxb0 = 0
+    if c.rollover
+        rxb0 = rxb0 | RXB_BUKT
+    if not reg_write(l, REG_RXB0, rxb0)
+        return -1
+    var rxb1 = RXM_ANY
+    if not c.accept_all
+        rxb1 = 0
+    if not reg_write(l, REG_RXB0 + 0x10, rxb1)
+        return -1
+    // The options and the mode request in one BIT MODIFY of CANCTRL.
+    let mask = CTRL_REQOP_MASK | CTRL_MASK_OPTS
+    if not reg_modify(l, REG_CANCTRL, mask, (c.mode << 5) | ctrl_opts(c))
+        return -1
+    if not mode_wait(l, c.mode)
+        return -5
+    0
+
+// Opens the part for `bitrate` at an oscillator of `osc_hz` with the
+// settings `c`: the bus and pins made ready, the part reset and confirmed in
+// Configuration mode, the bit timing written and read back, the interrupt
+// enables, the receive buffer modes, the options and the mode, which is
+// confirmed in CANSTAT.
+//
+// Answers 0 when the part took everything; -1 when it does not answer or
+// the wiring has no chip select; -2 for a mode outside 0 to 4; -3 for a bit
+// rate the oscillator cannot make; -4 when the bit timing did not read back
+// as written; -5 when the mode did not take within 50 ms.
+pub fn open_code<L: MccLink>(l: L, osc_hz: Int, bitrate: Int, c: Mcp2515Config) -> Int [hw]
+    if c.mode < 0 or c.mode > MCP_MODE_CONFIG
+        return -2
+    var t = c.timing
+    if t < 0
+        t = bit_timing(osc_hz, bitrate)
+    if t < 0
+        return -3
+    if not l.link_setup()
+        return -1
+    if not reset(l)
+        return -1
+    open_regs(l, t, c)
+
+// What `CanBus.open` does: `mode` is `CAN_MODE_NORMAL` or
+// `CAN_MODE_LOOPBACK`, and the other settings are the defaults.  Whether
+// the part took them.
+pub fn open_simple<L: MccLink>(l: L, osc_hz: Int, bitrate: Int, mode: Int) -> Bool [hw]
+    var c = config_default()
+    if mode == 1
+        c = Mcp2515Config { mode: MCP_MODE_LOOPBACK, one_shot: c.one_shot, rollover: c.rollover,
+                            accept_all: c.accept_all, irq_mask: c.irq_mask, clkout: c.clkout,
+                            timing: c.timing }
+    elif mode != 0
+        return false
+    open_code(l, osc_hz, bitrate, c) == 0
+
+// ── Transmit ─────────────────────────────────────────────────────────
+
+// The bytes SIDH to DLC of a frame, then its data bytes, in `tx` after the
+// LOAD TX BUFFER command byte.  A remote frame loads the five header bytes
+// only.
+fn put_frame(var tx: DevBytes, f: CanBusFrame)
+    let r = id_regs(f.id, f.extended)
+    let _ = tx.push(((r >> 24) & 0xFF) as u8)
+    let _ = tx.push(((r >> 16) & 0xFF) as u8)
+    let _ = tx.push(((r >> 8) & 0xFF) as u8)
+    let _ = tx.push((r & 0xFF) as u8)
+    var dlc = f.len
+    if f.remote
+        dlc = dlc | 0x40
+    let _ = tx.push(dlc as u8)
+    if not f.remote
+        for i in 0..f.len
+            let _ = tx.push(embedded_hal.can_byte(f, i) as u8)
+
+// The first free transmit buffer after the highest pending one, or -1:
+// the buffers are filled in order so that the part, which sends the
+// highest priority first and the highest number first among equals, sends
+// them in the order they were queued (see `send_frame`).
+fn next_buffer(status: Int) -> Int
+    if (status & ST_TXREQ2) != 0
+        return -1
+    if (status & ST_TXREQ1) != 0
+        return 2
+    if (status & ST_TXREQ0) != 0
+        return 1
+    0
+
+// A free buffer for a send at an explicit priority: the lowest one with
+// TXREQ clear, or -1.
+fn free_buffer(status: Int) -> Int
+    if (status & ST_TXREQ0) == 0
+        return 0
+    if (status & ST_TXREQ1) == 0
+        return 1
+    if (status & ST_TXREQ2) == 0
+        return 2
+    -1
+
+// Loads `f` into buffer `b` at priority `prio`, 0 to 3, and requests to
+// send: BIT MODIFY of TXP, LOAD TX BUFFER, RTS.  The buffer's TXREQ is
+// clear, as the data sheet requires before a load (§ 3.1), because the
+// callers chose it from READ STATUS.
+fn load_and_send<L: MccLink>(l: L, b: Int, prio: Int, f: CanBusFrame) -> Bool [hw]
+    if not reg_modify(l, REG_TXB0 + 0x10 * b, TXP_MASK, prio)
+        return false
+    var tx: DevBytes = Vec.new()
+    let _ = tx.push((CMD_LOAD_TX + 2 * b) as u8)
+    put_frame(var tx, f)
+    var none: DevBytes = Vec.new()
+    if not l.link_xfer(tx, 0, var none)
+        return false
+    var rts: DevBytes = Vec.new()
+    let _ = rts.push((CMD_RTS + (1 << b)) as u8)
+    l.link_xfer(rts, 0, var none)
+
+// Queues a frame behind those already queued.  The three buffers hold the
+// priorities 2, 1 and 0, and the part sends the highest priority first, so
+// a frame goes into the buffer after the highest one waiting: the frames
+// leave in the order they were queued.  Answers the buffer used, 0 to 2;
+// -1 when no buffer is free in that order, which is when TXB2 waits; -2
+// for a frame that is not valid (an identifier too wide for its type, or a
+// length outside 0 to 8); -3 when the part does not answer.
+//
+// Fix kept: two buffers of equal priority send the higher number first
+// (§ 3.2), so a driver that fills the free buffers in order at one priority
+// sends two queued frames in the wrong order.  The Arduino libraries and
+// the `mcp2515` crate fill the first free buffer and leave the priority at
+// its power-up value of 0.
+pub fn send_frame<L: MccLink>(l: L, f: CanBusFrame) -> Int [hw]
+    if not embedded_hal.can_frame_valid(f)
+        return -2
+    let st = status_read(l)
+    if st < 0
+        return -3
+    let b = next_buffer(st)
+    if b < 0
+        return -1
+    // The buffers have priority 2, 1 and 0: the lower the number, the
+    // sooner it is sent.
+    if load_and_send(l, b, 2 - b, f)
+        return b
+    -3
+
+// Sends a frame at the priority `prio`, 0 to 3, 3 the highest, in the
+// lowest buffer that is free.  Frames of equal priority are sent highest
+// buffer first, and a frame that lost arbitration is sent again before
+// those of lower priority.  Answers the buffer used, or the negative codes
+// of `send_frame`, -1 meaning that all three buffers wait.
+pub fn send_prio<L: MccLink>(l: L, f: CanBusFrame, prio: Int) -> Int [hw]
+    if not embedded_hal.can_frame_valid(f) or prio < 0 or prio > 3
+        return -2
+    let st = status_read(l)
+    if st < 0
+        return -3
+    let b = free_buffer(st)
+    if b < 0
+        return -1
+    if load_and_send(l, b, prio, f)
+        return b
+    -3
+
+// The buffers waiting to be sent as a mask, TXB0 in bit 0, or -1.
+pub fn tx_pending<L: MccLink>(l: L) -> Int [hw]
+    let st = status_read(l)
+    if st < 0
+        return -1
+    var m = 0
+    if (st & ST_TXREQ0) != 0
+        m = m | 1
+    if (st & ST_TXREQ1) != 0
+        m = m | 2
+    if (st & ST_TXREQ2) != 0
+        m = m | 4
+    m
+
+// Whether no buffer waits to be sent and the part has been opened, which
+// is to say it is not in Configuration mode, the mode it is in after a
+// reset.  A frame that met an error stays pending, so this stays false
+// until it is sent or aborted.
+pub fn tx_idle<L: MccLink>(l: L) -> Bool [hw]
+    if tx_pending(l) != 0
+        return false
+    mode_read(l) != Some(MCP_MODE_CONFIG)
+
+// Aborts every frame waiting to be sent: ABAT set, TXREQ polled until all
+// three clear, ABAT cleared.  The abort is cleared even when the polling
+// ran out, since the part sends nothing while ABAT is set (§ 3.6).  A frame
+// already on the bus is sent to its end.  Whether every buffer was free
+// afterwards.
+pub fn tx_abort_all<L: MccLink>(l: L) -> Bool [hw]
+    if not reg_modify(l, REG_CANCTRL, CTRL_ABAT, CTRL_ABAT)
+        return false
+    var clear = false
+    for _i in 0..ABORT_TRIES
+        if not clear
+            if tx_pending(l) == 0
+                clear = true
+            else
+                l.link_wait(MODE_STEP_US)
+    let ok = reg_modify(l, REG_CANCTRL, CTRL_ABAT, 0)
+    ok and clear
+
+// Sets or clears one-shot mode (CANCTRL.OSM): with it set a frame attempts
+// transmission once, whether it loses arbitration or meets an error (§
+// 3.4).  Whether the part took it.
+pub fn one_shot_set<L: MccLink>(l: L, on: Bool) -> Bool [hw]
+    if on
+        return reg_modify(l, REG_CANCTRL, CTRL_OSM, CTRL_OSM)
+    reg_modify(l, REG_CANCTRL, CTRL_OSM, 0)
+
+// ── Receive ──────────────────────────────────────────────────────────
+
+// Reads the buffer `n`, 0 or 1, with READ RX BUFFER, which starts at its
+// SIDH and clears its RXnIF flag when CS is raised, in one transaction of
+// 13 bytes.
+//
+// Fix kept: the flag is cleared by the instruction and not by a write of
+// CANINTF afterwards, as the Arduino libraries do, which costs a transaction
+// and leaves a window in which a second message has overwritten the first.
+fn read_buffer<L: MccLink>(l: L, n: Int) -> ?CanBusFrame [hw]
+    var tx: DevBytes = Vec.new()
+    let _ = tx.push((CMD_RX_BUFFER + 4 * n) as u8)
+    var b: DevBytes = Vec.new()
+    if not l.link_xfer(tx, 13, var b)
+        return None
+    Some(frame_of_buffer(b))
+
+// The next frame received, or `None` at once when none waits or the part
+// does not answer.  RX STATUS says which buffer holds one, RXB0 first, and
+// READ RX BUFFER reads it and releases the buffer.
+pub fn receive_frame<L: MccLink>(l: L) -> ?CanBusFrame [hw]
+    let s = rx_status_read(l)
+    if s < 0
+        return None
+    if (s & 0x40) != 0
+        return read_buffer(l, 0)
+    if (s & 0x80) != 0
+        return read_buffer(l, 1)
+    None
+
+// As `receive_frame`, but reads the INT pin first and makes no SPI
+// transaction while it is high.  The pin follows the sources enabled in
+// CANINTE (`irq_enable`), so with the receive sources enabled it is low
+// while a frame waits.  A wiring with no INT pin polls.
+pub fn receive_irq<L: MccLink>(l: L) -> ?CanBusFrame [hw]
+    if l.link_irq() == 1
+        return None
+    receive_frame(l)
+
+// The level of the INT pin, 0 when asserted, 1 when idle, -1 for a wiring
+// with no interrupt pin.
+pub fn irq_level<L: MccLink>(l: L) -> Int [hw]
+    l.link_irq()
+
+// ── Interrupt flags, errors ──────────────────────────────────────────
+
+// CANINTF, or `None`.
+pub fn irq_flags<L: MccLink>(l: L) -> ?Int [hw]
+    reg_read(l, REG_CANINTF)
+
+// Clears the flags of `mask` in CANINTF.  The part does not clear the
+// error and wake-up flags itself.  A receive flag is cleared by reading its
+// buffer, so clearing it here discards the message in it.  Whether the
+// part took it.
+pub fn irq_clear<L: MccLink>(l: L, mask: Int) -> Bool [hw]
+    reg_modify(l, REG_CANINTF, mask, 0)
+
+// Sets the sources of the INT pin, CANINTE.  Whether the part took it.
+pub fn irq_enable<L: MccLink>(l: L, mask: Int) -> Bool [hw]
+    reg_write(l, REG_CANINTE, mask)
+
+// EFLG, or `None`.
+pub fn eflg_read<L: MccLink>(l: L) -> ?Int [hw]
+    reg_read(l, REG_EFLG)
+
+// Clears the two receive overflow flags of EFLG, which the part sets when a
+// frame arrives for a full buffer and does not clear (§ 4.2).  A buffer
+// that stays full loses every frame after the first.  Whether the part took
+// it.
+pub fn eflg_clear_overflow<L: MccLink>(l: L) -> Bool [hw]
+    reg_modify(l, REG_EFLG, EFLG_OVR, 0)
+
+// The error counters and the fault confinement state: the transmit and
+// receive counters from TEC and REC, and the state from EFLG, bus-off when
+// TXBO is set, error-passive when TXEP or RXEP is, else error-active.  The
+// part leaves bus-off by itself after 128 occurrences of 11 recessive bits
+// (§ 6.7).  `None` when the part does not answer.
+pub fn errors_read<L: MccLink>(l: L) -> ?CanBusErrors [hw]
+    var b: DevBytes = Vec.new()
+    if not regs_read(l, REG_TEC, 2, var b)
+        return None
+    let Some(e) = eflg_read(l) else return None
+    var state = embedded_hal.CAN_ERROR_ACTIVE
+    if (e & (EFLG_TXEP | EFLG_RXEP)) != 0
+        state = embedded_hal.CAN_ERROR_PASSIVE
+    if (e & EFLG_TXBO) != 0
+        state = embedded_hal.CAN_BUS_OFF
+    Some(CanBusErrors { tx: b[0] as Int, rx: b[1] as Int, state: state })
+
+// The error counters for `CanBus.errors`, which has no way to say that the
+// part did not answer: zeros and error-active in that case.
+pub fn errors_or_idle<L: MccLink>(l: L) -> CanBusErrors [hw]
+    match errors_read(l)
+        Some(e) => e
+        None    => CanBusErrors { tx: 0, rx: 0, state: embedded_hal.CAN_ERROR_ACTIVE }
+
+// The bit rate the timing registers hold, for an oscillator of `osc_hz`, or
+// 0 when they hold their power-up value of zero, which is not a bit rate
+// anyone configures, or the part does not answer.
+pub fn bitrate_read<L: MccLink>(l: L, osc_hz: Int) -> Int [hw]
+    var b: DevBytes = Vec.new()
+    if not regs_read(l, REG_CNF3, 3, var b)
+        return 0
+    let t = bit_timing_pack(b[2] as Int, b[1] as Int, b[0] as Int)
+    if t == 0
+        return 0
+    timing_rate(osc_hz, t)
+
+// ── Acceptance masks and filters ─────────────────────────────────────
+
+// The address of filter `n`, 0 to 5, RXF0 to RXF5.
+fn filter_addr(n: Int) -> Int
+    if n < 3
+        return 4 * n
+    0x10 + 4 * (n - 3)
+
+// Writes four bytes from `addr`, in Configuration mode only, and reads them
+// back: the part ignores a write in any other mode and reads these
+// registers as zero, so the read-back is what shows the write took.
+fn write4_checked<L: MccLink>(l: L, addr: Int, r: Int) -> Bool [hw]
+    if mode_read(l) != Some(MCP_MODE_CONFIG)
+        return false
+    var tx: DevBytes = Vec.new()
+    let _ = tx.push(CMD_WRITE as u8)
+    let _ = tx.push(addr as u8)
+    let _ = tx.push(((r >> 24) & 0xFF) as u8)
+    let _ = tx.push(((r >> 16) & 0xFF) as u8)
+    let _ = tx.push(((r >> 8) & 0xFF) as u8)
+    let _ = tx.push((r & 0xFF) as u8)
+    var none: DevBytes = Vec.new()
+    if not l.link_xfer(tx, 0, var none)
+        return false
+    var back: DevBytes = Vec.new()
+    if not regs_read(l, addr, 4, var back)
+        return false
+    let got = ((back[0] as Int) << 24) | ((back[1] as Int) << 16) | ((back[2] as Int) << 8) | (back[3] as Int)
+    got == r
+
+// Sets acceptance filter `n`, 0 to 5, to an identifier.  `extended` selects
+// whether it applies to extended or to standard frames (its EXIDE bit).
+// Filters 0 and 1 belong to RXB0 and its mask 0, filters 2 to 5 to RXB1 and
+// mask 1 (§ 4.5.2).  A standard filter's EID bits are written zero, so the
+// first two data bytes of a standard frame are not compared unless the
+// mask asks.  Whether the part took it; `false` outside Configuration mode
+// (`config_enter`) and for a filter outside 0 to 5.
+pub fn filter_set<L: MccLink>(l: L, n: Int, id: Int, extended: Bool) -> Bool [hw]
+    if n < 0 or n > 5
+        return false
+    write4_checked(l, filter_addr(n), id_regs(id, extended))
+
+// Sets acceptance mask `n`, 0 or 1, to the identifier bits that must match.
+// A mask has no EXIDE bit, so it is written without one, and a standard
+// mask has its EID bits zero, which leaves the data bytes out of the
+// comparison.  A bit set in the mask is compared with the filter; a bit
+// clear is not.  Whether the part took it; `false` outside Configuration
+// mode and for a mask outside 0 and 1.
+pub fn mask_set<L: MccLink>(l: L, n: Int, mask: Int, extended: Bool) -> Bool [hw]
+    if n < 0 or n > 1
+        return false
+    let r = id_regs(mask, extended)
+    write4_checked(l, REG_RXM0 + 4 * n, r & (0xFFFFFFFF ^ 0x00080000))
+
+// Sets how both receive buffers choose frames: with `accept_all` the masks
+// and filters are off (RXM 11) and every frame is received; without it the
+// masks and filters decide (RXM 00).  `rollover` lets RXB0 overflow into
+// RXB1 (BUKT).  Any mode.  Whether the part took it.
+pub fn rx_mode_set<L: MccLink>(l: L, accept_all: Bool, rollover: Bool) -> Bool [hw]
+    var rxm = 0
+    if accept_all
+        rxm = RXM_ANY
+    var b0 = rxm
+    if rollover
+        b0 = b0 | RXB_BUKT
+    if not reg_modify(l, REG_RXB0, RXM_ANY | RXB_BUKT, b0)
+        return false
+    reg_modify(l, REG_RXB0 + 0x10, RXM_ANY, rxm)
+
+// ── The part on a board ──────────────────────────────────────────────
+
+// The link over a board's SPI bus, GPIO and timer.  The wiring names the
+// chip-select pin (`w.cs`) and the INT pin (`w.irq`), and the bus.
+pub @value
+struct Mcp2515Link
+    bus: BoardSpi
+    pins: BoardGpio
+    timer: BoardTimer
+    w: DeviceWiring
+
+// The bus and pin framing as functions over the traits, so a test runs them
+// over a double of the part.
+
+// Makes the bus and the pins ready: chip select driven high first, then an
+// output, so the pin never drives low until a transaction; the INT pin an
+// input with a pull-up, since the line is open-drain and active low; the
+// bus at 4 MHz in mode 0.  Answers whether the wiring has a chip select.
+pub fn spi_ready<B: SpiBus, G: GpioOut>(bus: B, pins: G, w: DeviceWiring) -> Bool [hw]
+    let Some(cs) = w.cs else return false
+    pins.set(cs, 1)
+    pins.mode(cs, 1)
+    if let Some(irq) = w.irq
+        pins.mode(irq, 2)
+    bus.init(SPI_HZ, SPI_MODE)
+    true
+
+// The level of the INT pin, 1 or 0, or -1 for a wiring with no interrupt
+// pin.
+pub fn irq_level_of<G: GpioOut>(pins: G, w: DeviceWiring) -> Int [hw]
+    let Some(irq) = w.irq else return -1
+    pins.get(irq)
+
+impl MccLink for Mcp2515Link
+    fn link_xfer(self, tx: DevBytes, n: Int, var dst: DevBytes) -> Bool [hw]
+        dev_bus.wiring_spi_exchange_into(self.bus, self.pins, self.w, tx, n, var dst)
+
+    fn link_wait(self, us: Int) [hw]
+        self.timer.delay_us(us)
+
+    fn link_irq(self) -> Int [hw]
+        irq_level_of(self.pins, self.w)
+
+    fn link_setup(self) -> Bool [hw]
+        spi_ready(self.bus, self.pins, self.w)
+
+// A MCP2515 on a board's SPI bus with the chip select `w.cs`, and the
+// oscillator it runs from.
+pub @value
+struct Mcp2515
+    link: Mcp2515Link
+    osc_hz: Int
+
+impl Mcp2515
+    // The part with the chip select `w.cs` (and the INT pin `w.irq`, if the
+    // wiring has one) on the board's SPI bus, with a crystal of `osc_hz`,
+    // as a board's device table builds it.  Nothing is sent.
+    fn attach(bus: BoardSpi, pins: BoardGpio, w: DeviceWiring, osc_hz: Int) -> Mcp2515
+        Mcp2515 { link: Mcp2515Link { bus: bus, pins: pins, timer: BoardTimer { id: 0 }, w: w },
+                  osc_hz: osc_hz }
+
+    // The link, for the functions of this module that take one.
+    fn as_link(self) -> Mcp2515Link
+        self.link
+
+    // Opens the part with the settings `c`: the code of `open_code`.
+    fn open_with(self, bitrate: Int, c: Mcp2515Config) -> Int [hw]
+        open_code(self.link, self.osc_hz, bitrate, c)
+
+    // Sends at the priority `prio`, 0 to 3, in a free buffer: the buffer
+    // used, or a negative code (`send_prio`).
+    fn send_priority(self, f: CanBusFrame, prio: Int) -> Int [hw]
+        send_prio(self.link, f, prio)
+
+    // The frame waiting, read by the INT pin first (`receive_irq`).
+    fn receive_by_pin(self) -> ?CanBusFrame [hw]
+        receive_irq(self.link)
+
+    // The mode the part is in, 0 to 4.
+    fn mode(self) -> ?Int [hw]
+        mode_read(self.link)
+
+    // Requests a mode and waits for it.
+    fn set_mode(self, mode: Int) -> Bool [hw]
+        mode_set(self.link, mode)
+
+    // The interrupt flags and their clearing.
+    fn flags(self) -> ?Int [hw]
+        irq_flags(self.link)
+
+    fn clear_flags(self, mask: Int) -> Bool [hw]
+        irq_clear(self.link, mask)
+
+    // The level of the INT pin, 0 when asserted, -1 with no pin.
+    fn int_level(self) -> Int [hw]
+        irq_level(self.link)
+
+    // Aborts every frame waiting to be sent.
+    fn abort_all(self) -> Bool [hw]
+        tx_abort_all(self.link)
+
+impl CanBus for Mcp2515
+    // Opens the part at `bitrate` in Normal or Loopback mode with the
+    // default settings (`open_simple`).
+    fn open(self, bitrate: Int, mode: Int) -> Bool [hw]
+        open_simple(self.link, self.osc_hz, bitrate, mode)
+
+    // Queues a frame behind those already queued (`send_frame`).
+    fn send(self, f: CanBusFrame) -> Bool [hw]
+        send_frame(self.link, f) >= 0
+
+    fn receive(self) -> ?CanBusFrame [hw]
+        receive_frame(self.link)
+
+    // Whether no buffer waits to be sent, and the part is open.
+    fn tx_done(self) -> Bool [hw]
+        tx_idle(self.link)
+
+    fn bitrate(self) -> Int [hw]
+        bitrate_read(self.link, self.osc_hz)
+
+    fn errors(self) -> CanBusErrors [hw]
+        errors_or_idle(self.link)

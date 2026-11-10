@@ -1,0 +1,84 @@
+/* can_echo.nv: a node on a CAN bus behind an MCP2515, which sends a
+ * counter once a second and prints every frame it receives
+ *
+ * Build:  bash tests/device_build.sh   (the package's own script)
+ *          or make this file the main of a package that depends on
+ *          mcp2515-nv and run
+ *              novo build --target=nrf52840-dk src/main.nv
+ * Run:    probe-rs run --chip nRF52840_xxAA main.elf
+ *
+ * NOT a `novo run` program: it targets a board and never ends.
+ *
+ * The part is an MCP2515 breakout with a TJA1050 or MCP2551 transceiver
+ * and a 16 MHz crystal, such as the Adafruit CAN FeatherWing, the Seeed
+ * CAN-BUS Shield or the MikroE CAN SPI board.  SCK, MOSI and MISO go to the
+ * board's first SPI bus, the breakout's CS to the pin named CS_PIN and its
+ * INT to the pin named INT_PIN, which are GPIO numbers of the board (pins
+ * 28 and 29, P0.28 and P0.29, on an nRF52840 DK).  CANH and CANL go to the
+ * bus, which needs a second node to acknowledge the frames, and 120 ohm
+ * terminators at its two ends.  A breakout with an 8 MHz crystal sets
+ * OSC_HZ to 8000000.
+ *
+ * The node runs at 500 kbit/s.  Once a second it sends a data frame with
+ * the identifier 0x123 and a counter in four bytes, and on every frame it
+ * receives it prints
+ *
+ *     rx 291 4 1 0 0 0
+ *
+ * the identifier in decimal, the length and the data bytes.  The INT pin is
+ * enabled for the two receive buffers, and the program reads a frame only
+ * when the pin is low.
+ *
+ * Effects the program declares: [hw], for the SPI bus, the pins, the UART
+ * and the timer.  It allocates nothing after it starts.
+ *
+ * Boards: the nRF52840-DK and the nRF54LM20-DK build this program, but
+ * neither board has a driver for its SPI master yet, so `BoardSpi` is
+ * absent hardware there and the program prints "mcp2515: no answer" until a
+ * board package names one with `@hal(spi)`.  The part has not been driven
+ * on a board.
+ */
+use embedded_hal.{ BoardSpi, BoardGpio, CanBusFrame }
+use dev_bus
+use mcp2515
+use mcp2515.{ Mcp2515, Mcp2515Config }
+
+// The breakout's chip-select and INT pins, and its crystal.
+const CS_PIN = 28
+const INT_PIN = 29
+const OSC_HZ = 16000000
+
+// Writes a received frame as `rx <id> <len> <bytes>`.
+fn show(f: CanBusFrame) [hw]
+    hal.uart.write("rx ")
+    hal.uart.write(str.from_int(f.id))
+    hal.uart.write(" ")
+    hal.uart.write(str.from_int(f.len))
+    for i in 0..f.len
+        hal.uart.write(" ")
+        hal.uart.write(str.from_int(embedded_hal.can_byte(f, i)))
+    hal.uart.write("\n")
+
+@tier(embedded)
+fn main() [hw]
+    let w = dev_bus.wiring_irq(dev_bus.wiring_spi(0, CS_PIN), INT_PIN)
+    let can = Mcp2515.attach(BoardSpi { id: 0 }, BoardGpio { id: 0 }, w, OSC_HZ)
+    // The part is ready some milliseconds after power-up.
+    hal.timer.delay_ms(10)
+    let cfg = Mcp2515Config { mode: mcp2515.MCP_MODE_NORMAL, one_shot: false, rollover: true,
+                              accept_all: true, irq_mask: mcp2515.MCP_INT_RX0 | mcp2515.MCP_INT_RX1,
+                              clkout: 0, timing: -1 }
+    if can.open_with(500000, cfg) != 0
+        hal.uart.write("mcp2515: no answer\n")
+        return
+    var count = 0
+    var ticks = 0
+    loop
+        if let Some(f) = can.receive_by_pin()
+            show(f)
+        hal.timer.delay_ms(10)
+        ticks = ticks + 1
+        if ticks >= 100
+            ticks = 0
+            count = count + 1
+            let _ = can.send_priority(embedded_hal.can_data(0x123, 4, count), 1)

@@ -108,7 +108,7 @@ let RXM_ANY  = 0x60
 let RXB_BUKT = 0x04
 
 // TXBnCTRL.
-let TXREQ = 0x08
+let TXREQ    = 0x08
 let TXP_MASK = 0x03
 
 // READ STATUS, the TXREQ bit of each buffer.
@@ -117,10 +117,10 @@ let ST_TXREQ1 = 0x10
 let ST_TXREQ2 = 0x40
 
 // EFLG.
-let EFLG_TXBO  = 0x20
-let EFLG_TXEP  = 0x10
-let EFLG_RXEP  = 0x08
-let EFLG_OVR   = 0xC0
+let EFLG_TXBO = 0x20
+let EFLG_TXEP = 0x10
+let EFLG_RXEP = 0x08
+let EFLG_OVR  = 0xC0
 
 // The SPI clock and mode `link_setup` asks for: 4 MHz, mode 0, which the
 // part supports to 10 MHz (§ 12.1).
@@ -145,30 +145,51 @@ let ABORT_TRIES = 100
 // ── The operating modes ──────────────────────────────────────────────
 
 // The modes of CANSTAT.OPMOD and CANCTRL.REQOP (§ 10).
-pub const MCP_MODE_NORMAL   = 0
-pub const MCP_MODE_SLEEP    = 1
+// Normal operation: the part sends and receives on the bus.
+pub const MCP_MODE_NORMAL = 0
+// Sleep: the part draws minimal current and wakes on bus activity when that wake-up is enabled.
+pub const MCP_MODE_SLEEP = 1
+// Loopback: a transmitted frame goes to the part's own receive buffers and is not sent on the bus.
 pub const MCP_MODE_LOOPBACK = 2
-pub const MCP_MODE_LISTEN   = 3
-pub const MCP_MODE_CONFIG   = 4
+// Listen-only: the part receives every frame and never drives the bus.
+pub const MCP_MODE_LISTEN = 3
+// Configuration: the only mode in which the bit timing, the masks and the filters can be written.
+pub const MCP_MODE_CONFIG = 4
 
 // The interrupt flags of CANINTF and the enables of CANINTE (Table 11-2).
-pub const MCP_INT_RX0   = 0x01
-pub const MCP_INT_RX1   = 0x02
-pub const MCP_INT_TX0   = 0x04
-pub const MCP_INT_TX1   = 0x08
-pub const MCP_INT_TX2   = 0x10
+// Receive buffer 0 holds a frame.
+pub const MCP_INT_RX0 = 0x01
+// Receive buffer 1 holds a frame.
+pub const MCP_INT_RX1 = 0x02
+// Transmit buffer 0 is empty.
+pub const MCP_INT_TX0 = 0x04
+// Transmit buffer 1 is empty.
+pub const MCP_INT_TX1 = 0x08
+// Transmit buffer 2 is empty.
+pub const MCP_INT_TX2 = 0x10
+// An error condition is flagged in EFLG.
 pub const MCP_INT_ERROR = 0x20
-pub const MCP_INT_WAKE  = 0x40
-pub const MCP_INT_MERR  = 0x80
+// The part woke up on bus activity.
+pub const MCP_INT_WAKE = 0x40
+// A message could not be transmitted or received because of an error on the bus.
+pub const MCP_INT_MERR = 0x80
 
 // The values of EFLG (Table 11-2).
+// An error counter has reached the warning limit of 96.
 pub const MCP_EFLG_EWARN = 0x01
+// The receive error counter has reached the warning limit.
 pub const MCP_EFLG_RXWAR = 0x02
+// The transmit error counter has reached the warning limit.
 pub const MCP_EFLG_TXWAR = 0x04
-pub const MCP_EFLG_RXEP  = 0x08
-pub const MCP_EFLG_TXEP  = 0x10
-pub const MCP_EFLG_TXBO  = 0x20
+// The receive error counter is at or above 128: error-passive.
+pub const MCP_EFLG_RXEP = 0x08
+// The transmit error counter is at or above 128: error-passive.
+pub const MCP_EFLG_TXEP = 0x10
+// The transmit error counter has reached 255: bus-off.
+pub const MCP_EFLG_TXBO = 0x20
+// Receive buffer 0 received a frame while it still held one.
 pub const MCP_EFLG_RX0OVR = 0x40
+// Receive buffer 1 received a frame while it still held one.
 pub const MCP_EFLG_RX1OVR = 0x80
 
 // ── What the part is told at open ────────────────────────────────────
@@ -251,9 +272,11 @@ pub fn bit_timing_pack(cnf1: Int, cnf2: Int, cnf3: Int) -> Int
 pub fn timing_cnf1(t: Int) -> Int
     (t >> 16) & 0xFF
 
+// CNF2 of a packed timing.
 pub fn timing_cnf2(t: Int) -> Int
     (t >> 8) & 0xFF
 
+// CNF3 of a packed timing.
 pub fn timing_cnf3(t: Int) -> Int
     t & 0xFF
 
@@ -360,20 +383,20 @@ fn timing_of(brp: Int, n: Int, sample_permille: Int, sjw: Int, sam: Bool) -> Int
 // libraries is left out (see `bit_timing_solve`).
 fn known_8mhz(rate: Int) -> Int
     match rate
-        5000    => bit_timing_pack(0xA7, 0xF6, 0x04)
-        10000   => bit_timing_pack(0x93, 0xF6, 0x04)
-        20000   => bit_timing_pack(0x89, 0xF6, 0x04)
-        31250   => bit_timing_pack(0x87, 0xE5, 0x03)
-        33333   => bit_timing_pack(0x85, 0xF6, 0x04)
-        40000   => bit_timing_pack(0x84, 0xF6, 0x04)
-        50000   => bit_timing_pack(0x84, 0xE5, 0x03)
-        80000   => bit_timing_pack(0x84, 0xD3, 0x01)
-        100000  => bit_timing_pack(0x81, 0xF6, 0x04)
-        125000  => bit_timing_pack(0x81, 0xE5, 0x03)
-        200000  => bit_timing_pack(0x80, 0xF6, 0x04)
-        250000  => bit_timing_pack(0x80, 0xE5, 0x03)
-        500000  => bit_timing_pack(0x00, 0xD1, 0x01)
-        _       => -1
+        5000   => bit_timing_pack(0xA7, 0xF6, 0x04)
+        10000  => bit_timing_pack(0x93, 0xF6, 0x04)
+        20000  => bit_timing_pack(0x89, 0xF6, 0x04)
+        31250  => bit_timing_pack(0x87, 0xE5, 0x03)
+        33333  => bit_timing_pack(0x85, 0xF6, 0x04)
+        40000  => bit_timing_pack(0x84, 0xF6, 0x04)
+        50000  => bit_timing_pack(0x84, 0xE5, 0x03)
+        80000  => bit_timing_pack(0x84, 0xD3, 0x01)
+        100000 => bit_timing_pack(0x81, 0xF6, 0x04)
+        125000 => bit_timing_pack(0x81, 0xE5, 0x03)
+        200000 => bit_timing_pack(0x80, 0xF6, 0x04)
+        250000 => bit_timing_pack(0x80, 0xE5, 0x03)
+        500000 => bit_timing_pack(0x00, 0xD1, 0x01)
+        _      => -1
 
 // The same for a 16 MHz crystal.
 fn known_16mhz(rate: Int) -> Int
@@ -457,17 +480,17 @@ pub fn regs_id(sidh: Int, sidl: Int, eid8: Int, eid0: Int) -> Int
 pub fn frame_of_buffer(b: DevBytes) -> CanBusFrame
     let sidl = b[1] as Int
     let ext = (sidl & 0x08) != 0
-    let dlc = (b[4] as Int) & 0x0F
+    let dlc = b[4] as Int & 0x0F
     var len = dlc
     if len > 8
         len = 8
     var remote = (sidl & 0x10) != 0
     if ext
-        remote = ((b[4] as Int) & 0x40) != 0
+        remote = (b[4] as Int & 0x40) != 0
     var data = 0
     if not remote
         for i in 0..len
-            data = data | ((b[5 + i] as Int) << (8 * i))
+            data = data | (b[5 + i] as Int << (8 * i))
     CanBusFrame { id: regs_id(b[0] as Int, sidl, b[2] as Int, b[3] as Int), extended: ext,
                   remote: remote, len: len, data: data }
 
@@ -981,7 +1004,7 @@ fn write4_checked<L: MccLink>(l: L, addr: Int, r: Int) -> Bool [hw]
     var back: DevBytes = Vec.new()
     if not regs_read(l, addr, 4, var back)
         return false
-    let got = ((back[0] as Int) << 24) | ((back[1] as Int) << 16) | ((back[2] as Int) << 8) | (back[3] as Int)
+    let got = (back[0] as Int << 24) | (back[1] as Int << 16) | (back[2] as Int << 8) | back[3] as Int
     got == r
 
 // Sets acceptance filter `n`, 0 to 5, to an identifier.  `extended` selects

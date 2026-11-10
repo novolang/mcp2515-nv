@@ -118,7 +118,7 @@ fn chip_read(c: Chip, a: Int) -> Int
 
 // Whether a register takes a write now.
 fn writable(c: Chip, a: Int) -> Bool
-    if a < 0x0C or (a >= 0x10 and a < 0x1C) or (a >= 0x20 and a <= 0x2A)
+    if a < 0x0C or a >= 0x10 and a < 0x1C or a >= 0x20 and a <= 0x2A
         if at(c.st, 26) == 1 and a < 0x28
             return false
         if at(c.st, 25) == 1 and a >= 0x28
@@ -589,7 +589,20 @@ fn test_the_registers_of_the_reference_libraries_make_their_rates() [io]
     // Every row of the table decodes, by the data sheet's formula
     // osc / (2 x BRP' x N), to its rate, with 5 to 25 TQ a bit and a PS2
     // of at least 2 TQ.  33.3 kbit/s is 33333.3, 31.25 kbit/s is exact.
-    let rates = [5000, 10000, 20000, 31250, 33333, 40000, 50000, 80000, 100000, 125000, 200000, 250000, 500000, 1000000]
+    let rates = [5000,
+        10000,
+        20000,
+        31250,
+        33333,
+        40000,
+        50000,
+        80000,
+        100000,
+        125000,
+        200000,
+        250000,
+        500000,
+        1000000]
     for osc in [8000000, 16000000]
         for rate in rates
             let t = mcp2515.bit_timing_known(osc, rate)
@@ -633,18 +646,30 @@ fn test_the_solver_finds_the_values_of_the_libraries() [io]
     // Where the solver and the libraries choose the same number of time
     // quanta, the registers are the same, with the SJW of the library and
     // CNF3's SOF bit clear.
-    test.assert_eq(mcp2515.bit_timing_solve(16000000, 500000, 750, 2, true), mcp2515.bit_timing_known(16000000, 500000))
-    test.assert_eq(mcp2515.bit_timing_solve(16000000, 250000, 750, 2, true), mcp2515.bit_timing_known(16000000, 250000))
-    test.assert_eq(mcp2515.bit_timing_solve(16000000, 125000, 750, 2, true), mcp2515.bit_timing_known(16000000, 125000))
-    test.assert_eq(mcp2515.bit_timing_solve(16000000, 1000000, 750, 1, true), mcp2515.bit_timing_known(16000000, 1000000))
-    test.assert_eq(mcp2515.bit_timing_solve(16000000, 200000, 750, 2, true), mcp2515.bit_timing_known(16000000, 200000))
-    test.assert_eq(mcp2515.bit_timing_solve(16000000, 50000, 750, 2, true), mcp2515.bit_timing_known(16000000, 50000))
-    test.assert_eq(mcp2515.bit_timing_solve(16000000, 5000, 750, 1, true), mcp2515.bit_timing_known(16000000, 5000))
-    test.assert_eq(mcp2515.bit_timing_solve(8000000, 250000, 750, 3, true), mcp2515.bit_timing_known(8000000, 250000))
-    test.assert_eq(mcp2515.bit_timing_solve(8000000, 125000, 750, 3, true), mcp2515.bit_timing_known(8000000, 125000))
-    test.assert_eq(mcp2515.bit_timing_solve(8000000, 100000, 750, 3, true), mcp2515.bit_timing_known(8000000, 100000))
-    test.assert_eq(mcp2515.bit_timing_solve(8000000, 200000, 750, 3, true), mcp2515.bit_timing_known(8000000, 200000))
-    test.assert_eq(mcp2515.bit_timing_solve(8000000, 31250, 750, 3, true), mcp2515.bit_timing_known(8000000, 31250))
+    test.assert_eq(mcp2515.bit_timing_solve(16000000, 500000, 750, 2, true),
+        mcp2515.bit_timing_known(16000000, 500000))
+    test.assert_eq(mcp2515.bit_timing_solve(16000000, 250000, 750, 2, true),
+        mcp2515.bit_timing_known(16000000, 250000))
+    test.assert_eq(mcp2515.bit_timing_solve(16000000, 125000, 750, 2, true),
+        mcp2515.bit_timing_known(16000000, 125000))
+    test.assert_eq(mcp2515.bit_timing_solve(16000000, 1000000, 750, 1, true),
+        mcp2515.bit_timing_known(16000000, 1000000))
+    test.assert_eq(mcp2515.bit_timing_solve(16000000, 200000, 750, 2, true),
+        mcp2515.bit_timing_known(16000000, 200000))
+    test.assert_eq(mcp2515.bit_timing_solve(16000000, 50000, 750, 2, true),
+        mcp2515.bit_timing_known(16000000, 50000))
+    test.assert_eq(mcp2515.bit_timing_solve(16000000, 5000, 750, 1, true),
+        mcp2515.bit_timing_known(16000000, 5000))
+    test.assert_eq(mcp2515.bit_timing_solve(8000000, 250000, 750, 3, true),
+        mcp2515.bit_timing_known(8000000, 250000))
+    test.assert_eq(mcp2515.bit_timing_solve(8000000, 125000, 750, 3, true),
+        mcp2515.bit_timing_known(8000000, 125000))
+    test.assert_eq(mcp2515.bit_timing_solve(8000000, 100000, 750, 3, true),
+        mcp2515.bit_timing_known(8000000, 100000))
+    test.assert_eq(mcp2515.bit_timing_solve(8000000, 200000, 750, 3, true),
+        mcp2515.bit_timing_known(8000000, 200000))
+    test.assert_eq(mcp2515.bit_timing_solve(8000000, 31250, 750, 3, true),
+        mcp2515.bit_timing_known(8000000, 31250))
 
 @test
 fn test_the_solver_makes_every_rate_the_table_has_at_its_sample_point() [io]
@@ -1558,7 +1583,20 @@ fn test_the_bit_rate_is_read_back_from_the_registers() [io]
     test.assert_eq(mcp2515.bitrate_read(link_nocs(n), 16000000), 0)
     // After open, every rate of the table makes the rate back.
     for osc in [8000000, 16000000]
-        for rate in [5000, 10000, 20000, 31250, 33333, 40000, 50000, 80000, 100000, 125000, 200000, 250000, 500000, 1000000]
+        for rate in [5000,
+    10000,
+    20000,
+    31250,
+    33333,
+    40000,
+    50000,
+    80000,
+    100000,
+    125000,
+    200000,
+    250000,
+    500000,
+    1000000]
             if mcp2515.bit_timing_known(osc, rate) >= 0
                 let c = chip()
                 test.assert_eq(mcp2515.open_code(link(c), osc, rate, mcp2515.config_default()), 0)

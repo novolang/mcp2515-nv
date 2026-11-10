@@ -61,18 +61,25 @@ probe-rs run --chip nRF52840_xxAA main.elf
 
 | Image | Flash | Of which the program | RAM (`.data` and `.bss`) |
 |---|---|---|---|
-| `nrf52840-dk` | 18,036 B | 6,070 B | 2,660 B |
-| `nrf54lm20-dk` | 18,936 B | 6,178 B | 2,644 B |
-| `frdm-mcxn947` | 20,288 B | 8,004 B | 2,668 B |
+| `nrf52840-dk` | 18,476 B | 6,502 B | 3,172 B |
+| `nrf54lm20-dk` | 19,516 B | 6,732 B | 3,156 B |
+| `frdm-mcxn947` | 20,292 B | 7,996 B | 2,668 B |
 
 The numbers are from the build's memory report. Flash also holds the runtime,
 the compiler's support library and the program's tables. The arena, 65,536 B
-on the Nordic boards, is the runtime's heap and is reserved whether or not
-the program uses it. The two Nordic board packages answer for SPI as absent
-hardware, so on those images `open_with` answers -1 until a board package
-names an SPI driver with `@hal(spi)`; the FRDM-MCXN947 board package drives
-SPI. The driver's own code allocates nothing: every buffer is a fixed-size
-`Vec` in the caller's frame.
+on the Nordic boards, is the runtime's heap and is reserved whether or not the
+program uses it. The Nordic DKs drive SPI with a SPIM (the nRF52840 DK's SPIM2
+on SCK P1.15, MISO P1.14 and MOSI P1.13, the nRF54LM20 DK's SPIM21 on SCK
+P1.07, MOSI P1.06 and MISO P1.05), on the pins `docs/hal/README.md` names
+under "The Nordic DKs' buses", and the chip select is a GPIO pin the caller
+drives, so all three rows are the image with the driver's reading path in it.
+Before the Nordic buses landed the two DK rows were 18,036 and 18,936 bytes of
+flash, of which the program was 6,070 and 6,178 bytes: the board packages
+answered for SPI as absent hardware, `open_with` answered -1, and the build
+removed the code that follows the first bus read.  A reply from the part over
+a DK's bus is NOT VERIFIED until the driver rig carries one.  The FRDM-MCXN947
+board package drives SPI too. The driver's own code allocates nothing: every
+buffer is a fixed-size `Vec` in the caller's frame.
 
 ### The effects
 

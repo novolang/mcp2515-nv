@@ -38,15 +38,17 @@ controller on an SPI bus.
   (error-active, error-passive, bus-off), and the overflow flags.
 - The suite runs over a double of the part and covers every line of `src/`.
 - The device program `examples/can_echo.nv`, a node that sends a counter and
-  prints the frames it receives. Built for the nRF52840-DK it is 18,036 B of
-  flash, for the nRF54LM20-DK 18,936 B and for the FRDM-MCXN947 20,288 B.
+  prints the frames it receives. Built for the nRF52840-DK it is 18,476 B of
+  flash, for the nRF54LM20-DK 19,516 B and for the FRDM-MCXN947 20,292 B;
+  before the Nordic buses landed, with the reading path left out, the two DK
+  images were 18,036 B and 18,936 B.
 
 ### Known
 
 - Hardware verification: NOT VERIFIED. No board carries an MCP2515.
-- The device program builds for the nRF52840 DK and the nRF54LM20 DK, whose
-  board packages answer for SPI as absent hardware: on those images
-  `open_with` answers -1 until the boards drive the bus.
+- The device program builds for the nRF52840 DK and the nRF54LM20 DK, which
+  drive SPI with SPIM2 and SPIM21, so their images carry the reading path.  A
+  reply from the part over either bus is NOT VERIFIED.
 - The `CanBus` trait of embedded-hal-nv 0.3.2 names two modes, no filters, no
   priority, no interrupt flags and no reason for a refused open: the
   driver's own functions beside the trait carry them.

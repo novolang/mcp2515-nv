@@ -1,6 +1,6 @@
 [package]
 name        = "mcp2515-nv"
-version     = "0.1.0"
+version     = "0.1.1"
 description = "A driver for Microchip's MCP2515 stand-alone CAN 2.0B controller on an SPI bus: embedded-hal-nv's CanBus with the bit timing computed from the crystal and the bit rate, the three transmit buffers with priority, the two receive buffers with masks, filters and rollover, the interrupt flags and the INT pin, the error counters and the bus-off state, and the normal, loopback, listen-only and one-shot modes."
 license     = "Apache-2.0"
 stability   = "experimental"
@@ -17,7 +17,7 @@ novo        = ">= 0.24.0"
 [dependencies]
 # The board's SPI bus, GPIO and timer handles, the SpiBus, GpioOut and
 # Timer traits they implement, and the CanBus trait this driver implements.
-embedded-hal-nv = "^0.3.2"
+embedded-hal-nv = "^0.4.0"
 # The wiring record a board's device table hands `attach`, and the SPI
 # transaction helpers.
-devices-nv      = "^0.3.2"
+devices-nv      = "^0.4.0"

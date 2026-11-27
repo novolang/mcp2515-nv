@@ -81,4 +81,4 @@ fn main() [hw]
         if ticks >= 100
             ticks = 0
             count = count + 1
-            let _ = can.send_priority(embedded_hal.can_data(0x123, 4, count), 1)
+            can.send_priority(embedded_hal.can_data(0x123, 4, count), 1)
